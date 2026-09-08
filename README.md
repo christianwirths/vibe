@@ -58,12 +58,14 @@ Sessions are named `<tool>-<label>` (or `<tool>-<n>` when unnamed). Attaching us
 
 A compact, always-on dashboard meant to sit in a corner terminal:
 
-- **LIMITS**  - per-window throttle state for Claude (5h / weekly / ...): `ok` normally, or
-  `LIMITED, resets in Hh MMm` (red) with a live countdown when a request has actually been
-  rate-limited. Claude Code only writes rate-limit data to the transcript when a request is
-  throttled (a `quotaLimits` event with `resetsAt`); there is **no** continuous "% of limit
-  used" persisted anywhere on disk, so this panel reports *whether you are throttled and when
-  it clears*, not a fuel gauge. A `codex` row is stubbed for when a Codex CLI is added.
+- **LIMITS**  - live usage bars for Claude, the same numbers `/usage` shows: 5h and weekly
+  utilization with a reset countdown. Fetched from the authenticated `GET /api/oauth/usage`
+  endpoint using your OAuth token in `~/.claude/.credentials.json` (sent only to Anthropic's
+  own API; `skip_spend=1`, so the read is free), refreshed by a background thread every 60s so
+  the UI never blocks. The bar turns yellow past 70% and red past 90%. If the call fails
+  (offline, token expired - open a Claude session to refresh it - or the *undocumented*
+  endpoint changes in a future CLI release) it falls back to throttle state parsed from the
+  transcripts. Override with `VIBE_USAGE_URL`. A `codex` row is stubbed for a future Codex CLI.
 - **AGENTS**  - every live Claude Code session on the home node: its label, idle time,
   what it is doing right now (tool call / thinking / writing), git branch, and per-session
   token totals. The idle timer is coloured by proximity to the prompt-cache TTL

@@ -9,7 +9,8 @@ NOTE on "usage": Claude Code does not persist your live rate-limit consumption t
 anywhere readable, so the THROUGHPUT panel shows recent output-token activity as a relative
 proxy, not the official percent-of-limit gauge.
 """
-import os, sys, glob, json, time, socket, subprocess, select, shutil, getpass
+import os, sys, glob, json, time, socket, subprocess, select, shutil, getpass, threading
+import urllib.request
 from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
@@ -237,6 +238,54 @@ def dur(secs):
         return f"{secs//3600}h{(secs%3600)//60:02d}"
     return f"{secs//86400}d{(secs%86400)//3600:02d}h"
 
+# --- live usage (the same data /usage draws) --------------------------------
+# GET /api/oauth/usage returns {five_hour:{utilization,resets_at}, seven_day:{...}}.
+# We use the OAuth token from ~/.claude/.credentials.json, refreshed by a background
+# thread every USAGE_EVERY seconds so the UI never blocks. skip_spend=1 => free read.
+USAGE_URL = os.environ.get(
+    "VIBE_USAGE_URL", "https://api.anthropic.com/api/oauth/usage?at_wall=1&skip_spend=1")
+USAGE_EVERY = 60
+_USAGE = {"data": None, "t": 0.0, "inflight": False}
+
+def oauth_token():
+    try:
+        d = json.load(open(os.path.join(HOME, ".claude", ".credentials.json")))
+        return d.get("claudeAiOauth", {}).get("accessToken")
+    except Exception:
+        return None
+
+def _do_fetch():
+    try:
+        tok = oauth_token()
+        if not tok:
+            _USAGE["data"] = None
+            return
+        req = urllib.request.Request(USAGE_URL, headers={
+            "Authorization": f"Bearer {tok}",
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": "vibe-mon",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=6) as r:
+            _USAGE["data"] = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        _USAGE["data"] = None
+    finally:
+        _USAGE["t"] = time.time()
+        _USAGE["inflight"] = False
+
+def usage_cached():
+    now = time.time()
+    if not _USAGE["inflight"] and now - _USAGE["t"] >= USAGE_EVERY:
+        _USAGE["inflight"] = True
+        threading.Thread(target=_do_fetch, daemon=True).start()
+    return _USAGE["data"]
+
+def bar(pct, width=18):
+    pct = max(0.0, min(100.0, float(pct)))
+    filled = int(round(pct / 100.0 * width))
+    return "█" * filled + "░" * (width - filled)
+
 # ---------- rendering ----------
 def hms(dt):
     if not dt:
@@ -276,24 +325,30 @@ def build(width):
     L.append(hdr)
     L.append(c(GRY, "-" * min(width, 78)))
 
-    # LIMITS (Claude): throttle state + reset countdown per window
-    lim = scan_limits()
-    L.append(c(MAG, " LIMITS ") + c(DIM, "Claude (throttle events only; no live % is stored on disk)"))
-    if not lim:
-        L.append("  " + c(DIM, "no throttle events on record (not rate-limited recently)"))
+    # LIMITS: live usage bars from /api/oauth/usage; fall back to transcript throttle events
+    usage = usage_cached()
+    L.append(c(MAG, " LIMITS ") + c(DIM, "Claude"))
+    if usage:
+        for key, label in (("five_hour", "5h"), ("seven_day", "week")):
+            u = usage.get(key) or {}
+            pct = u.get("utilization")
+            if pct is None:
+                continue
+            r = parse_ts(u.get("resets_at", "")) if isinstance(u.get("resets_at"), str) else None
+            cd = dur((r - now_utc()).total_seconds()) if r else "?"
+            bcol = GRN if pct < 70 else (YEL if pct < 90 else RED)
+            L.append("  " + vpad(label, 6) + c(bcol, bar(pct)) + f" {int(round(pct)):>3}%  " + c(DIM, f"resets {cd}"))
+        L.append("  " + vpad("codex", 6) + c(DIM, "not configured"))
     else:
-        for typ, (tv, q) in sorted(lim.items(), key=lambda kv: LIMIT_LABEL.get(kv[0], kv[0])):
+        note = "waiting for usage..." if _USAGE["t"] == 0 else "usage endpoint unavailable - throttle events only"
+        L.append("  " + c(DIM, note))
+        for typ, (tv, q) in sorted(scan_limits().items(), key=lambda kv: LIMIT_LABEL.get(kv[0], kv[0])):
             label = LIMIT_LABEL.get(typ, typ)
             resets = q.get("resetsAt", 0) or 0
-            limited = q.get("status") == "rejected" and resets > time.time()
-            if limited:
-                reason = q.get("overageDisabledReason") or ""
-                cell = c(RED, vpad(f"LIMITED, resets in {dur(resets - time.time())}", 32))
-                L.append("  " + vpad(label, 9) + cell + c(DIM, reason))
+            if q.get("status") == "rejected" and resets > time.time():
+                L.append("  " + vpad(label, 6) + c(RED, vpad(f"LIMITED, resets in {dur(resets - time.time())}", 30)))
             else:
-                ago = dur(time.time() - tv) if tv else "?"
-                L.append("  " + vpad(label, 9) + c(GRN, vpad("ok", 32)) + c(DIM, f"last throttle {ago} ago"))
-    L.append("  " + vpad("codex", 9) + c(DIM, "not configured"))
+                L.append("  " + vpad(label, 6) + c(GRN, vpad("ok", 30)))
     L.append("")
 
     # AGENTS (parse each live session's transcript once, reuse for THROUGHPUT)
