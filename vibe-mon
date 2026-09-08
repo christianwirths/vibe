@@ -19,6 +19,7 @@ USER = getpass.getuser()
 TAIL_BYTES = 256 * 1024          # how much of each transcript tail to parse
 RECENT_WINDOW = 300              # seconds counted as "recent" for throughput
 ACTIVE_WINDOW = 25               # seconds since last event to count a session "active"
+CACHE_TTL = float(os.environ.get("VIBE_CACHE_TTL", 3600))  # prompt-cache TTL; idle past this = decached
 
 NO_COLOR = bool(os.environ.get("NO_COLOR"))
 def c(code, s):
@@ -307,15 +308,27 @@ def build(width):
             stale += 1
     agents.sort(key=lambda t: t[0])
     L.append(c(CYN, f" AGENTS ({len(agents)} live" + (f", {stale} off-node" if stale else "") + ")"))
-    L.append(c(DIM, "  " + "label".ljust(20) + "state".ljust(9) + "doing".ljust(24) + "branch".ljust(12) + "~tok".rjust(6)))
+    L.append(c(DIM, "  " + "label".ljust(20) + "idle".ljust(9) + "doing".ljust(24) + "branch".ljust(12) + "~tok".rjust(6)))
     if not agents:
         L.append(c(DIM, "  (no live sessions on this node)"))
     for label, st in agents:
         last = st.get("last_ts")
-        active = bool(last and (now_utc() - last).total_seconds() < ACTIVE_WINDOW)
-        state_txt = f"{'*' if active else ' '} {hms(last)}"
+        idle = (now_utc() - last).total_seconds() if last else 1e9
+        active = idle < ACTIVE_WINDOW
+        # colour the idle timer by proximity to the prompt-cache TTL (decache risk)
+        if active:
+            scol, marker = GRN, "*"
+        elif idle >= CACHE_TTL:
+            scol, marker = RED, "!"                # past TTL: context almost certainly decached
+        elif idle >= 0.85 * CACHE_TTL:
+            scol, marker = RED, " "                # imminent decache
+        elif idle >= 0.60 * CACHE_TTL:
+            scol, marker = YEL, " "
+        else:
+            scol, marker = GRY, " "
+        state_txt = f"{marker} {hms(last)}"
         row = ("  " + vpad(label, 20)
-               + vpad(state_txt, 9, GRN if active else GRY)
+               + vpad(state_txt, 9, scol)
                + vpad(st.get("doing", "-"), 24, YEL if active else GRY)
                + vpad(st.get("branch", "-") or "-", 12)
                + f"{kfmt(st.get('tail_tok', 0)):>6}")
@@ -355,7 +368,7 @@ def build(width):
     L.append(c(CYN, " NODES ") + "  ".join(cells))
 
     L.append("")
-    L.append(c(DIM, " q quit  |  refresh loop"))
+    L.append(c(DIM, f" q quit   idle: {c(GRN,'*active')} {c(GRY,'fresh')} {c(YEL,'>'+str(int(0.6*CACHE_TTL/60))+'m')} {c(RED,'>'+str(int(0.85*CACHE_TTL/60))+'m/decached')}  (cache TTL {int(CACHE_TTL/60)}m)"))
     return L
 
 def main():

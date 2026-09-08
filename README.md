@@ -64,9 +64,12 @@ A compact, always-on dashboard meant to sit in a corner terminal:
   throttled (a `quotaLimits` event with `resetsAt`); there is **no** continuous "% of limit
   used" persisted anywhere on disk, so this panel reports *whether you are throttled and when
   it clears*, not a fuel gauge. A `codex` row is stubbed for when a Codex CLI is added.
-- **AGENTS**  - every live Claude Code session on the home node: its label, idle/active
-  state, what it is doing right now (tool call / thinking / writing), git branch, and
-  per-session token totals.
+- **AGENTS**  - every live Claude Code session on the home node: its label, idle time,
+  what it is doing right now (tool call / thinking / writing), git branch, and per-session
+  token totals. The idle timer is coloured by proximity to the prompt-cache TTL
+  (`VIBE_CACHE_TTL`, default 3600s): green `*` active, grey fresh, yellow past 60%, red past
+  85% and `!` once idle exceeds the TTL (context is then likely decached, so the next turn
+  pays a full cache miss).
 - **THROUGHPUT** - recent output-token rate, a *relative* activity signal (see LIMITS for why
   it is not the official rate-limit percentage).
 - **SLURM**   - your running and pending jobs (`squeue`), with node and elapsed time.
