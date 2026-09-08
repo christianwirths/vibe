@@ -10,7 +10,7 @@ anywhere readable, so the THROUGHPUT panel shows recent output-token activity as
 proxy, not the official percent-of-limit gauge.
 """
 import os, sys, re, glob, json, time, socket, subprocess, select, shutil, getpass, threading
-import urllib.request
+import urllib.request, urllib.error
 from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
@@ -244,8 +244,10 @@ def dur(secs):
 # thread every USAGE_EVERY seconds so the UI never blocks. skip_spend=1 => free read.
 USAGE_URL = os.environ.get(
     "VIBE_USAGE_URL", "https://api.anthropic.com/api/oauth/usage?at_wall=1&skip_spend=1")
-USAGE_EVERY = 60
-_USAGE = {"data": None, "t": 0.0, "inflight": False}
+USAGE_EVERY = float(os.environ.get("VIBE_USAGE_EVERY", 120))  # endpoint is itself rate-limited; poll gently
+USAGE_BACKOFF = 300                                           # wait longer after a failure (e.g. HTTP 429)
+# Keep last-known-good data across transient failures so the bars don't vanish on a blip.
+_USAGE = {"data": None, "ok_t": 0.0, "next_t": 0.0, "inflight": False, "err": None}
 
 def oauth_token():
     try:
@@ -255,10 +257,11 @@ def oauth_token():
         return None
 
 def _do_fetch():
+    ok = False
     try:
         tok = oauth_token()
         if not tok:
-            _USAGE["data"] = None
+            _USAGE["err"] = "no token"
             return
         req = urllib.request.Request(USAGE_URL, headers={
             "Authorization": f"Bearer {tok}",
@@ -268,15 +271,20 @@ def _do_fetch():
         })
         with urllib.request.urlopen(req, timeout=6) as r:
             _USAGE["data"] = json.loads(r.read().decode("utf-8", "replace"))
+        _USAGE["ok_t"] = time.time()
+        _USAGE["err"] = None
+        ok = True
+    except urllib.error.HTTPError as e:
+        _USAGE["err"] = f"HTTP {e.code}"
     except Exception:
-        _USAGE["data"] = None
+        _USAGE["err"] = "net error"
     finally:
-        _USAGE["t"] = time.time()
+        # normal cadence on success; back off after a failure so we do not worsen a 429
+        _USAGE["next_t"] = time.time() + (USAGE_EVERY if ok else USAGE_BACKOFF)
         _USAGE["inflight"] = False
 
 def usage_cached():
-    now = time.time()
-    if not _USAGE["inflight"] and now - _USAGE["t"] >= USAGE_EVERY:
+    if not _USAGE["inflight"] and time.time() >= _USAGE["next_t"]:
         _USAGE["inflight"] = True
         threading.Thread(target=_do_fetch, daemon=True).start()
     return _USAGE["data"]
@@ -375,9 +383,13 @@ def build(width):
             cd = dur((r - now_utc()).total_seconds()) if r else "?"
             bcol = GRN if pct < 70 else (YEL if pct < 90 else RED)
             p.append("  " + vpad(label, 6) + c(bcol, bar(pct, 16)) + f" {int(round(pct)):>3}%  " + c(DIM, f"resets {cd}"))
+        stale = time.time() - _USAGE["ok_t"] if _USAGE["ok_t"] else 0
+        if _USAGE["err"] and stale > USAGE_EVERY * 2:
+            p.append("  " + c(DIM, f"stale {dur(stale)} ({_USAGE['err']})"))
         p.append("  " + vpad("codex", 6) + c(DIM, "not configured"))
     else:
-        note = "waiting for usage..." if _USAGE["t"] == 0 else "usage unavailable - throttle only"
+        note = "waiting for usage..." if (_USAGE["ok_t"] == 0 and not _USAGE["err"]) \
+            else f"usage unavailable ({_USAGE['err'] or '...'}) - throttle only"
         p.append("  " + c(DIM, note))
         for typ, (tv, q) in sorted(scan_limits().items(), key=lambda kv: LIMIT_LABEL.get(kv[0], kv[0])):
             label = LIMIT_LABEL.get(typ, typ)
