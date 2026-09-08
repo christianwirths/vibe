@@ -9,7 +9,7 @@ NOTE on "usage": Claude Code does not persist your live rate-limit consumption t
 anywhere readable, so the THROUGHPUT panel shows recent output-token activity as a relative
 proxy, not the official percent-of-limit gauge.
 """
-import os, sys, glob, json, time, socket, subprocess, select, shutil, getpass, threading
+import os, sys, re, glob, json, time, socket, subprocess, select, shutil, getpass, threading
 import urllib.request
 from datetime import datetime, timezone
 
@@ -312,22 +312,59 @@ def short_path(p, n=22):
     p = p.replace(HOME, "~")
     return p if len(p) <= n else "..." + p[-(n-3):]
 
+# --- responsive column layout ----------------------------------------------
+_ANSI = re.compile(r"\033\[[0-9;]*m")
+def vislen(s):
+    return len(_ANSI.sub("", s))
+def vfill(s, w):
+    pad = w - vislen(s)
+    return s + " " * pad if pad > 0 else s
+def panel_w(p):
+    return max((vislen(x) for x in p), default=0)
+
+def columnize(panels, width, gutter=3, maxcols=3):
+    """Pack panels (each a list of lines) into as many equal-width columns as `width`
+    allows, balancing height (shortest-column masonry). Falls back to one column."""
+    colw = max((panel_w(p) for p in panels), default=10)
+    ncols = max(1, min(maxcols, (width + gutter) // (colw + gutter)))
+    cols = [[] for _ in range(ncols)]
+    heights = [0] * ncols
+    for p in panels:
+        i = heights.index(min(heights))
+        if cols[i]:
+            cols[i].append(""); heights[i] += 1
+        cols[i].extend(p); heights[i] += len(p)
+    if ncols == 1:
+        return cols[0]
+    H = max((len(cc) for cc in cols), default=0)
+    out = []
+    for r in range(H):
+        parts = []
+        for ci in range(ncols):
+            cell = cols[ci][r] if r < len(cols[ci]) else ""
+            if ci < ncols - 1:
+                cell = vfill(cell, colw)
+            parts.append(cell)
+        out.append((" " * gutter).join(parts).rstrip())
+    return out
+
 def build(width):
-    L = []
-    home_short = os.environ.get("VIBE_HOME_SHORT", "submit03")
     dom = domain()
+    home_short = os.environ.get("VIBE_HOME_SHORT", "submit03")
     home_fqdn = f"{home_short}.{dom}" if dom else home_short
     try:
         socket.gethostbyname(home_fqdn); anchor = c(GRN, "ok")
     except Exception:
         anchor = c(RED, "UNRESOLVED")
-    hdr = f" vibe mon  {c(BOLD, socket.gethostname())}  {now_utc().astimezone().strftime('%H:%M:%S')}  home={home_short}[{anchor}]"
-    L.append(hdr)
-    L.append(c(GRY, "-" * min(width, 78)))
+    header = [
+        f" vibe mon  {c(BOLD, socket.gethostname())}  {now_utc().astimezone().strftime('%H:%M:%S')}  home={home_short}[{anchor}]",
+        c(GRY, "-" * min(width, 118)),
+    ]
+    panels = []
 
     # LIMITS: live usage bars from /api/oauth/usage; fall back to transcript throttle events
     usage = usage_cached()
-    L.append(c(MAG, " LIMITS ") + c(DIM, "Claude"))
+    p = [c(MAG, " LIMITS ") + c(DIM, "Claude")]
     if usage:
         for key, label in (("five_hour", "5h"), ("seven_day", "week")):
             u = usage.get(key) or {}
@@ -337,19 +374,19 @@ def build(width):
             r = parse_ts(u.get("resets_at", "")) if isinstance(u.get("resets_at"), str) else None
             cd = dur((r - now_utc()).total_seconds()) if r else "?"
             bcol = GRN if pct < 70 else (YEL if pct < 90 else RED)
-            L.append("  " + vpad(label, 6) + c(bcol, bar(pct)) + f" {int(round(pct)):>3}%  " + c(DIM, f"resets {cd}"))
-        L.append("  " + vpad("codex", 6) + c(DIM, "not configured"))
+            p.append("  " + vpad(label, 6) + c(bcol, bar(pct, 16)) + f" {int(round(pct)):>3}%  " + c(DIM, f"resets {cd}"))
+        p.append("  " + vpad("codex", 6) + c(DIM, "not configured"))
     else:
-        note = "waiting for usage..." if _USAGE["t"] == 0 else "usage endpoint unavailable - throttle events only"
-        L.append("  " + c(DIM, note))
+        note = "waiting for usage..." if _USAGE["t"] == 0 else "usage unavailable - throttle only"
+        p.append("  " + c(DIM, note))
         for typ, (tv, q) in sorted(scan_limits().items(), key=lambda kv: LIMIT_LABEL.get(kv[0], kv[0])):
             label = LIMIT_LABEL.get(typ, typ)
             resets = q.get("resetsAt", 0) or 0
             if q.get("status") == "rejected" and resets > time.time():
-                L.append("  " + vpad(label, 6) + c(RED, vpad(f"LIMITED, resets in {dur(resets - time.time())}", 30)))
+                p.append("  " + vpad(label, 6) + c(RED, f"LIMITED, resets {dur(resets - time.time())}"))
             else:
-                L.append("  " + vpad(label, 6) + c(GRN, vpad("ok", 30)))
-    L.append("")
+                p.append("  " + vpad(label, 6) + c(GRN, "ok"))
+    panels.append(p)
 
     # AGENTS (parse each live session's transcript once, reuse for THROUGHPUT)
     sessions = read_sessions()
@@ -362,10 +399,10 @@ def build(width):
         else:
             stale += 1
     agents.sort(key=lambda t: t[0])
-    L.append(c(CYN, f" AGENTS ({len(agents)} live" + (f", {stale} off-node" if stale else "") + ")"))
-    L.append(c(DIM, "  " + "label".ljust(20) + "idle".ljust(9) + "doing".ljust(24) + "branch".ljust(12) + "~tok".rjust(6)))
+    p = [c(CYN, f" AGENTS ({len(agents)} live" + (f", {stale} off" if stale else "") + ")"),
+         c(DIM, "  " + "label".ljust(16) + "idle".ljust(8) + "doing".ljust(16) + "br".ljust(7) + "~tok".rjust(6))]
     if not agents:
-        L.append(c(DIM, "  (no live sessions on this node)"))
+        p.append(c(DIM, "  (no live sessions here)"))
     for label, st in agents:
         last = st.get("last_ts")
         idle = (now_utc() - last).total_seconds() if last else 1e9
@@ -381,50 +418,47 @@ def build(width):
             scol, marker = YEL, " "
         else:
             scol, marker = GRY, " "
-        state_txt = f"{marker} {hms(last)}"
-        row = ("  " + vpad(label, 20)
-               + vpad(state_txt, 9, scol)
-               + vpad(st.get("doing", "-"), 24, YEL if active else GRY)
-               + vpad(st.get("branch", "-") or "-", 12)
-               + f"{kfmt(st.get('tail_tok', 0)):>6}")
-        L.append(row)
+        p.append("  " + vpad(label, 16)
+                 + vpad(f"{marker} {hms(last)}", 8, scol)
+                 + vpad(st.get("doing", "-"), 16, YEL if active else GRY)
+                 + vpad(st.get("branch", "-") or "-", 7)
+                 + f"{kfmt(st.get('tail_tok', 0)):>6}")
+    panels.append(p)
 
     # THROUGHPUT (proxy)
     total_recent = sum(st.get("recent_tok", 0) for _, st in agents)
     rate = total_recent / (RECENT_WINDOW / 60.0)
-    L.append("")
-    L.append(c(MAG, " THROUGHPUT ") + c(DIM, "(output-token proxy, not the official rate-limit gauge)"))
-    L.append(f"  last {RECENT_WINDOW//60}m: {c(BOLD, kfmt(total_recent))} out-tok   ~{c(BOLD, kfmt(rate))}/min")
+    panels.append([
+        c(MAG, " THROUGHPUT ") + c(DIM, "out-tok proxy"),
+        f"  last {RECENT_WINDOW//60}m: {c(BOLD, kfmt(total_recent))}  ~{c(BOLD, kfmt(rate))}/min",
+    ])
 
     # SLURM
     jobs, err = squeue_jobs()
-    L.append("")
     if err:
-        L.append(c(BLU, " SLURM ") + c(YEL, err))
+        panels.append([c(BLU, " SLURM ") + c(YEL, err)])
     else:
         run = [j for j in jobs if j["st"] == "RUNNING"]
         pend = [j for j in jobs if j["st"] == "PENDING"]
-        L.append(c(BLU, f" SLURM ({len(run)} run, {len(pend)} pend)"))
+        p = [c(BLU, f" SLURM ({len(run)} run, {len(pend)} pend)")]
         for j in (run + pend)[:8]:
             stc = c(GRN, "R") if j["st"] == "RUNNING" else c(YEL, "P")
-            where = j["reason"][:16]     # %R = nodelist when running, reason when pending
-            L.append("  " + stc + " " + vpad(j["id"], 11) + vpad(j["name"], 19) + f"{j['time']:>8}  " + where)
+            p.append("  " + stc + " " + vpad(j["id"], 11) + vpad(j["name"], 15) + f"{j['time']:>7} " + j["reason"][:13])
         if len(run) + len(pend) > 8:
-            L.append(c(DIM, f"  ... +{len(run)+len(pend)-8} more"))
+            p.append(c(DIM, f"  ... +{len(run)+len(pend)-8} more"))
+        panels.append(p)
 
     # NODES
     nodes = os.environ.get("VIBE_NODES", "submit01 submit02 submit03 submit04").split()
-    L.append("")
     cells = []
     for n in nodes:
         fq = f"{n}.{dom}" if dom else n
-        up = node_reach(fq)
-        cells.append(c(GRN, n) if up else c(RED, n + "!"))
-    L.append(c(CYN, " NODES ") + "  ".join(cells))
+        cells.append(c(GRN, n) if node_reach(fq) else c(RED, n + "!"))
+    panels.append([c(CYN, " NODES"), "  " + "  ".join(cells)])
 
-    L.append("")
-    L.append(c(DIM, f" q quit   idle: {c(GRN,'*active')} {c(GRY,'fresh')} {c(YEL,'>'+str(int(0.6*CACHE_TTL/60))+'m')} {c(RED,'>'+str(int(0.85*CACHE_TTL/60))+'m/decached')}  (cache TTL {int(CACHE_TTL/60)}m)"))
-    return L
+    body = columnize(panels, width)
+    footer = ["", c(DIM, f" q quit   idle {c(GRN,'*')} {c(GRY,'fresh')} {c(YEL,'>'+str(int(0.6*CACHE_TTL/60))+'m')} {c(RED,'>'+str(int(0.85*CACHE_TTL/60))+'m')}  cache {int(CACHE_TTL/60)}m")]
+    return header + [""] + body + footer
 
 def main():
     interval = 3.0

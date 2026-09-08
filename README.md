@@ -83,7 +83,9 @@ vibe mon 5            # 5s refresh
 VIBE_NODES="submit01 submit02 submit03 submit04" vibe mon   # override the node list
 ```
 
-Quit with `q` or `Ctrl-C`.
+The panels auto-arrange into 1-3 equal-width columns to fill the terminal width (balanced,
+shortest-column first); make the window wider and they reflow into more columns, narrower and
+they stack. Quit with `q` or `Ctrl-C`.
 
 ## How the home-node model works
 
