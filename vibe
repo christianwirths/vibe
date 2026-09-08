@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# vibe — persistent tmux sessions for coding agents (or any command), with a
+# multi-session picker so you can run several at once.
+#
+#   vibe                     pick/create a plain shell session ("work-N")
+#   vibe claude              pick an existing claude session, or start a new one
+#   vibe claude myproj       jump straight to session "claude-myproj" (create if new)
+#   vibe codex myproj --resume   session "codex-myproj" running `codex --resume`
+#
+# Sessions for a tool are named <tool>-<label> (or <tool>-N when auto-numbered).
+# `vibe claude` with sessions present shows a menu of them + a "new" entry.
+#
+# All sessions live on one node ($HOME_NODE) so they survive reconnects and
+# landing on a different login node. Set HOME_NODE="" to use the current node.
+
+set -euo pipefail
+
+HOME_SHORT="submit03"                  # "" = current node, no hopping
+# Build HOME_NODE from the domain the cluster currently advertises, so a login-node
+# domain rename (e.g. ubelix.unibe.ch -> hpc.unibe.ch) doesn't strand sessions.
+_fqdn="$(hostname -f 2>/dev/null)"
+if [[ -n "$HOME_SHORT" && "$_fqdn" == *.* ]]; then
+  HOME_NODE="${HOME_SHORT}.${_fqdn#*.}"
+else
+  HOME_NODE="$HOME_SHORT"
+fi
+
+tool="${1:-work}"; shift || true
+base="${tool//[^a-zA-Z0-9_-]/_}"
+
+# --- If pinned to a node and not on it, re-run this script there (or fall back).
+if [[ -n "$HOME_NODE" && "$(hostname -f 2>/dev/null)" != "$HOME_NODE" ]]; then
+  self="$(readlink -f "$0")"
+  # Interactive flows need a tty; read-only management subcommands don't, and -t
+  # prints a noisy "Connection to <node> closed." banner. Choose per subcommand.
+  case "$tool" in
+    --ls|-l|--kill|-k|--rename|-r) hop_opts=(-q) ;;
+    *)                             hop_opts=(-t) ;;
+  esac
+  if ssh -o BatchMode=yes -o ConnectTimeout=5 "$HOME_NODE" true 2>/dev/null; then
+    exec ssh "${hop_opts[@]}" "$HOME_NODE" "$(printf '%q ' "$self" "$tool" "$@")"
+  else
+    echo "vibe: $HOME_NODE unreachable — falling back to $(hostname -s)." >&2
+    echo "vibe: sessions on $HOME_NODE are not reachable from here." >&2
+  fi
+fi
+
+# --- from here we're on the session's home node ---
+
+# Management subcommands (run after the hop, so they act on $HOME_NODE):
+case "$tool" in
+  --mon|mon|-m)
+    export VIBE_HOME_SHORT="$HOME_SHORT"
+    exec python3 "$(dirname "$(readlink -f "$0")")/vibe-mon" "$@" ;;
+  --ls|-l)
+    tmux ls 2>/dev/null || echo "(no sessions)"; exit 0 ;;
+  --kill|-k)
+    tmux kill-session -t "${1:?usage: vibe --kill <session>}" && echo "vibe: killed '$1'"; exit 0 ;;
+  --rename|-r)
+    old="${1:?usage: vibe --rename <session> <new-label>}"
+    lbl="${2:?usage: vibe --rename <session> <new-label>}"; lbl="${lbl//[^a-zA-Z0-9_-]/_}"
+    pfx="${old%%-*}"                    # keep the <tool>- prefix so it stays in the picker
+    if [[ "$pfx" != "$old" ]]; then new="${pfx}-${lbl}"; else new="$lbl"; fi
+    tmux rename-session -t "$old" "$new" && echo "vibe: renamed '$old' -> '$new'"; exit 0 ;;
+esac
+
+# Optional explicit label: first remaining arg. Rest = args to the tool.
+label=""
+if [[ $# -gt 0 ]]; then label="${1//[^a-zA-Z0-9_-]/_}"; shift; fi
+
+# Command that runs inside a *new* session. Empty = plain shell.
+# Run the tool, then drop to a shell so the session survives when it exits.
+if [[ "$tool" == "work" ]]; then
+  INNER=""
+else
+  INNER="$(printf '%q ' "$tool" "$@"); exec \$SHELL"
+fi
+
+new_session() { # $1 = session name
+  if [[ -z "$INNER" ]]; then tmux new -d -s "$1"; else tmux new -d -s "$1" "$INNER"; fi
+}
+enter() {       # $1 = session name (switch if inside tmux, else attach)
+  # attach -d detaches any stale/other client first, so you never end up with
+  # two differently-sized clients on one session (the usual cause of garbled,
+  # misaligned redraws when reconnecting from a different place).
+  if [[ -n "${TMUX:-}" ]]; then exec tmux switch-client -t "$1"; else exec tmux attach -d -t "$1"; fi
+}
+ensure_enter() { # $1 = session name
+  tmux has-session -t "$1" 2>/dev/null || new_session "$1"
+  enter "$1"
+}
+annotate() {     # $1 = session name -> "2w, detached"
+  tmux display-message -p -t "$1" \
+    '#{session_windows}w, #{?session_attached,attached,detached}' 2>/dev/null || true
+}
+
+# Numbered picker. Echoes chosen session name, or __new__ / __cancel__.
+menu() {
+  local names=("$@") displays=() n
+  for n in "${names[@]}"; do displays+=("$n   [$(annotate "$n")]"); done
+  displays+=("＋ start a NEW $tool session")
+  local PS3=$'\nPick # (Ctrl-C to abort): ' choice
+  select choice in "${displays[@]}"; do
+    [[ -z "$choice" ]] && continue
+    [[ "$choice" == ＋* ]] && { echo __new__; return; }
+    echo "${names[$((REPLY-1))]}"; return
+  done < /dev/tty
+  echo __cancel__
+}
+
+# 1) Explicit label -> go straight there.
+if [[ -n "$label" ]]; then ensure_enter "${base}-${label}"; fi
+
+# 2) No label: list this tool's sessions.
+mapfile -t existing < <(tmux ls -F '#{session_name}' 2>/dev/null | grep -xE "${base}(-.*)?" || true)
+
+# None yet -> create the first automatically.
+if [[ ${#existing[@]} -eq 0 ]]; then new_session "${base}-1"; enter "${base}-1"; fi
+
+# Some exist -> let the user choose or start a new one.
+echo "Running $tool sessions on $(hostname -s):" >&2
+choice="$(menu "${existing[@]}")"
+case "$choice" in
+  __cancel__) echo "vibe: cancelled." >&2; exit 0 ;;
+  __new__)
+    n=1; while tmux has-session -t "${base}-${n}" 2>/dev/null; do ((n++)); done
+    new_session "${base}-${n}"; enter "${base}-${n}" ;;
+  *) enter "$choice" ;;
+esac

@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""vibe mon - a compact, always-on terminal dashboard for Claude Code agents + SLURM jobs.
+
+Dependency-free (standard library only). Meant to sit in a corner terminal and refresh in
+place. Reads the shared ~/.claude state, so it sees every session on the node it runs on
+(vibe hops it to the home node). Quit with 'q' or Ctrl-C.
+
+NOTE on "usage": Claude Code does not persist your live rate-limit consumption to disk
+anywhere readable, so the THROUGHPUT panel shows recent output-token activity as a relative
+proxy, not the official percent-of-limit gauge.
+"""
+import os, sys, glob, json, time, socket, subprocess, select, shutil, getpass
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+SESS_DIR = os.path.join(HOME, ".claude", "sessions")
+PROJ_DIR = os.path.join(HOME, ".claude", "projects")
+USER = getpass.getuser()
+TAIL_BYTES = 256 * 1024          # how much of each transcript tail to parse
+RECENT_WINDOW = 300              # seconds counted as "recent" for throughput
+ACTIVE_WINDOW = 25               # seconds since last event to count a session "active"
+
+NO_COLOR = bool(os.environ.get("NO_COLOR"))
+def c(code, s):
+    return s if NO_COLOR else f"\033[{code}m{s}\033[0m"
+BOLD="1"; DIM="2"; RED="31"; GRN="32"; YEL="33"; BLU="34"; MAG="35"; CYN="36"; GRY="90"
+
+def vpad(s, width, color=None):
+    """Truncate/pad a PLAIN string to visible width, then colorize (so color codes
+    never corrupt column alignment)."""
+    s = str(s)
+    if len(s) > width:
+        s = s[:width-1] + "…"
+    s = s + " " * (width - len(s))
+    return c(color, s) if color else s
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def parse_ts(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+def domain():
+    try:
+        f = socket.getfqdn()
+        return f.split(".", 1)[1] if "." in f else ""
+    except Exception:
+        return ""
+
+def read_sessions():
+    out = []
+    for f in glob.glob(os.path.join(SESS_DIR, "*.json")):
+        try:
+            d = json.load(open(f))
+            out.append(d)
+        except Exception:
+            continue
+    return out
+
+def pid_alive(pid):
+    try:
+        p = f"/proc/{int(pid)}"
+        if not os.path.isdir(p):
+            return False
+        comm = open(os.path.join(p, "comm")).read().strip()
+        return comm in ("claude", "node")
+    except Exception:
+        return False
+
+def transcript_for(session_id):
+    hits = glob.glob(os.path.join(PROJ_DIR, "*", f"{session_id}.jsonl"))
+    if not hits:
+        return None
+    return max(hits, key=lambda p: os.path.getmtime(p))
+
+def tail_events(path):
+    """Return parsed JSON events from the tail of a transcript."""
+    try:
+        sz = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if sz > TAIL_BYTES:
+                fh.seek(sz - TAIL_BYTES)
+                fh.readline()  # drop partial first line
+            data = fh.read().decode("utf-8", "replace")
+    except Exception:
+        return []
+    evs = []
+    for ln in data.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            evs.append(json.loads(ln))
+        except Exception:
+            continue
+    return evs
+
+def describe_activity(ev):
+    """Human label of what the last assistant turn is doing."""
+    try:
+        content = ev.get("message", {}).get("content", [])
+        tools = [b.get("name") for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+        types = [b.get("type") for b in content if isinstance(b, dict)]
+        if tools:
+            return "run " + ",".join(t for t in tools if t)[:22]
+        if "thinking" in types:
+            return "thinking"
+        if "text" in types:
+            return "writing"
+    except Exception:
+        pass
+    return "-"
+
+def agent_stats(session_id):
+    path = transcript_for(session_id)
+    if not path:
+        return None
+    evs = tail_events(path)
+    if not evs:
+        return {"path": path, "last_ts": None, "doing": "-", "recent_tok": 0, "tail_tok": 0, "model": "-", "branch": "-"}
+    last_ts = None
+    recent_tok = 0
+    tail_tok = 0
+    last_assist = None
+    model = "-"
+    branch = "-"
+    cutoff = now_utc().timestamp() - RECENT_WINDOW
+    for ev in evs:
+        ts = parse_ts(ev.get("timestamp", "")) if isinstance(ev.get("timestamp"), str) else None
+        if ts and (last_ts is None or ts > last_ts):
+            last_ts = ts
+        if ev.get("gitBranch"):
+            branch = ev["gitBranch"]
+        if ev.get("type") == "assistant":
+            last_assist = ev
+            m = ev.get("message", {})
+            if m.get("model"):
+                model = str(m["model"]).replace("claude-", "")
+            ot = 0
+            try:
+                ot = int(m.get("usage", {}).get("output_tokens", 0))
+            except Exception:
+                ot = 0
+            tail_tok += ot
+            if ts and ts.timestamp() >= cutoff:
+                recent_tok += ot
+    doing = describe_activity(last_assist) if last_assist else "-"
+    return {"path": path, "last_ts": last_ts, "doing": doing,
+            "recent_tok": recent_tok, "tail_tok": tail_tok, "model": model, "branch": branch}
+
+def squeue_jobs():
+    try:
+        r = subprocess.run(
+            ["squeue", "-u", USER, "-h", "-o", "%i|%T|%M|%D|%R|%j"],
+            capture_output=True, text=True, timeout=6)
+    except subprocess.TimeoutExpired:
+        return None, "squeue timeout"
+    except FileNotFoundError:
+        return [], "no squeue"
+    except Exception as e:
+        return None, f"squeue err: {e}"
+    jobs = []
+    for ln in r.stdout.splitlines():
+        parts = ln.split("|")
+        if len(parts) >= 6:
+            jid, st, tm, nds, reason, name = parts[:6]
+            jobs.append({"id": jid, "st": st, "time": tm, "nodes": nds,
+                         "reason": reason, "name": name})
+    return jobs, None
+
+def node_reach(host, port=22, timeout=1.2):
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+# ---------- rendering ----------
+def hms(dt):
+    if not dt:
+        return "  -  "
+    secs = int((now_utc() - dt).total_seconds())
+    if secs < 0:
+        secs = 0
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs//60}m{secs%60:02d}"
+    return f"{secs//3600}h{(secs%3600)//60:02d}"
+
+def kfmt(n):
+    if n >= 1_000_000:
+        return f"{n/1e6:.1f}M"
+    if n >= 1000:
+        return f"{n/1e3:.1f}k"
+    return str(int(n))
+
+def short_path(p, n=22):
+    if not p:
+        return "-"
+    p = p.replace(HOME, "~")
+    return p if len(p) <= n else "..." + p[-(n-3):]
+
+def build(width):
+    L = []
+    home_short = os.environ.get("VIBE_HOME_SHORT", "submit03")
+    dom = domain()
+    home_fqdn = f"{home_short}.{dom}" if dom else home_short
+    try:
+        socket.gethostbyname(home_fqdn); anchor = c(GRN, "ok")
+    except Exception:
+        anchor = c(RED, "UNRESOLVED")
+    hdr = f" vibe mon  {c(BOLD, socket.gethostname())}  {now_utc().astimezone().strftime('%H:%M:%S')}  home={home_short}[{anchor}]"
+    L.append(hdr)
+    L.append(c(GRY, "-" * min(width, 78)))
+
+    # AGENTS (parse each live session's transcript once, reuse for THROUGHPUT)
+    sessions = read_sessions()
+    agents = []
+    stale = 0
+    for s in sessions:
+        if pid_alive(s.get("pid")):
+            label = str(s.get("tmux") or "").split(":")[0] or ("sess-" + str(s.get("sessionId", ""))[:6])
+            agents.append((label, agent_stats(s.get("sessionId", "")) or {}))
+        else:
+            stale += 1
+    agents.sort(key=lambda t: t[0])
+    L.append(c(CYN, f" AGENTS ({len(agents)} live" + (f", {stale} off-node" if stale else "") + ")"))
+    L.append(c(DIM, "  " + "label".ljust(20) + "state".ljust(9) + "doing".ljust(24) + "branch".ljust(12) + "~tok".rjust(6)))
+    if not agents:
+        L.append(c(DIM, "  (no live sessions on this node)"))
+    for label, st in agents:
+        last = st.get("last_ts")
+        active = bool(last and (now_utc() - last).total_seconds() < ACTIVE_WINDOW)
+        state_txt = f"{'*' if active else ' '} {hms(last)}"
+        row = ("  " + vpad(label, 20)
+               + vpad(state_txt, 9, GRN if active else GRY)
+               + vpad(st.get("doing", "-"), 24, YEL if active else GRY)
+               + vpad(st.get("branch", "-") or "-", 12)
+               + f"{kfmt(st.get('tail_tok', 0)):>6}")
+        L.append(row)
+
+    # THROUGHPUT (proxy)
+    total_recent = sum(st.get("recent_tok", 0) for _, st in agents)
+    rate = total_recent / (RECENT_WINDOW / 60.0)
+    L.append("")
+    L.append(c(MAG, " THROUGHPUT ") + c(DIM, "(output-token proxy, not the official rate-limit gauge)"))
+    L.append(f"  last {RECENT_WINDOW//60}m: {c(BOLD, kfmt(total_recent))} out-tok   ~{c(BOLD, kfmt(rate))}/min")
+
+    # SLURM
+    jobs, err = squeue_jobs()
+    L.append("")
+    if err:
+        L.append(c(BLU, " SLURM ") + c(YEL, err))
+    else:
+        run = [j for j in jobs if j["st"] == "RUNNING"]
+        pend = [j for j in jobs if j["st"] == "PENDING"]
+        L.append(c(BLU, f" SLURM ({len(run)} run, {len(pend)} pend)"))
+        for j in (run + pend)[:8]:
+            stc = c(GRN, "R") if j["st"] == "RUNNING" else c(YEL, "P")
+            where = j["reason"][:16]     # %R = nodelist when running, reason when pending
+            L.append("  " + stc + " " + vpad(j["id"], 11) + vpad(j["name"], 19) + f"{j['time']:>8}  " + where)
+        if len(run) + len(pend) > 8:
+            L.append(c(DIM, f"  ... +{len(run)+len(pend)-8} more"))
+
+    # NODES
+    nodes = os.environ.get("VIBE_NODES", "submit01 submit02 submit03 submit04").split()
+    L.append("")
+    cells = []
+    for n in nodes:
+        fq = f"{n}.{dom}" if dom else n
+        up = node_reach(fq)
+        cells.append(c(GRN, n) if up else c(RED, n + "!"))
+    L.append(c(CYN, " NODES ") + "  ".join(cells))
+
+    L.append("")
+    L.append(c(DIM, " q quit  |  refresh loop"))
+    return L
+
+def main():
+    interval = 3.0
+    for a in sys.argv[1:]:
+        try:
+            interval = max(1.0, float(a)); break
+        except Exception:
+            pass
+    istty = sys.stdin.isatty() and sys.stdout.isatty()
+    old = None
+    if istty:
+        import termios, tty
+        old = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
+        sys.stdout.write("\033[?25l\033[?1049h")  # hide cursor, alt screen
+    try:
+        while True:
+            width = shutil.get_terminal_size((80, 24)).columns
+            lines = build(width)
+            out = "\033[H\033[2J" if istty else "\n"
+            sys.stdout.write(out + "\r\n".join(lines) + "\r\n")
+            sys.stdout.flush()
+            if istty:
+                r, _, _ = select.select([sys.stdin], [], [], interval)
+                if r:
+                    ch = sys.stdin.read(1)
+                    if ch in ("q", "Q"):
+                        break
+            else:
+                time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if istty and old is not None:
+            import termios
+            sys.stdout.write("\033[?25h\033[?1049l")  # show cursor, leave alt screen
+            sys.stdout.flush()
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,3 @@
+# nothing tracked yet beyond the tool + docs
+*.bak
+__pycache__/
