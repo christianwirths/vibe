@@ -58,23 +58,26 @@ Sessions are named `<tool>-<label>` (or `<tool>-<n>` when unnamed). Attaching us
 
 A compact, always-on dashboard meant to sit in a corner terminal:
 
-- **LIMITS**  - live usage bars for Claude, the same numbers `/usage` shows: 5h and weekly
-  utilization with a reset countdown. Fetched from the authenticated `GET /api/oauth/usage`
-  endpoint using your OAuth token in `~/.claude/.credentials.json` (sent only to Anthropic's
-  own API; `skip_spend=1`, so the read is free), refreshed by a background thread (default
-  every 120s, `VIBE_USAGE_EVERY`; the endpoint is itself rate-limited, so poll gently) so the
-  UI never blocks. The bar turns yellow past 70% and red past 90%. On a transient failure it
-  keeps showing the last-known bars with a `stale` note and backs off before retrying, rather
-  than blanking. If it never succeeds (offline, token expired - open a Claude session to
-  refresh it - or the *undocumented* endpoint changes in a future CLI release) it falls back to
-  throttle state parsed from the transcripts. Override with `VIBE_USAGE_URL`. A `codex` row is
-  stubbed for a future Codex CLI.
-- **AGENTS**  - every live Claude Code session on the home node: its label, idle time,
-  what it is doing right now (tool call / thinking / writing), git branch, and per-session
-  token totals. The idle timer is coloured by proximity to the prompt-cache TTL
-  (`VIBE_CACHE_TTL`, default 3600s): green `*` active, grey fresh, yellow past 60%, red past
-  85% and `!` once idle exceeds the TTL (context is then likely decached, so the next turn
-  pays a full cache miss).
+- **LIMITS**  - live usage bars for Claude, the same numbers `/usage` shows: one bar per active
+  limit window - 5h session, weekly (all models), and any model-scoped weekly such as `wk:Fable`
+  - each with utilization and a reset countdown. Read from the `limits` array of the
+  authenticated `GET /api/oauth/usage` endpoint using your OAuth token in
+  `~/.claude/.credentials.json` (sent only to Anthropic's own API; `skip_spend=1`, so the read is
+  free), refreshed by a background thread (default every 120s, `VIBE_USAGE_EVERY`; the endpoint
+  is itself rate-limited, so poll gently) so the UI never blocks. A bar turns yellow past 70% and
+  red past 90%. On a transient failure it keeps the last-known bars with a `stale` note and backs
+  off before retrying, rather than blanking. If it never succeeds (offline, token expired - open
+  a Claude session to refresh it - or the *undocumented* endpoint changes in a future CLI
+  release) it falls back to throttle state parsed from the transcripts. Override with
+  `VIBE_USAGE_URL`. A `codex` row is stubbed for a future Codex CLI.
+- **AGENTS**  - every live Claude Code session on the home node: its label, idle time, what it
+  is doing right now (tool call / thinking / writing), git branch, and its **context-window
+  fill** (`ctx`: the prompt size of the last turn and the % of the window it fills). The window
+  is chosen adaptively per session (200k, or 1M once a session exceeds 200k); set
+  `VIBE_CTX_WINDOW` to pin it. The fill turns yellow past 70% and red past 85%. The idle timer is
+  coloured by proximity to the prompt-cache TTL (`VIBE_CACHE_TTL`, default 3600s): green `*`
+  active, grey fresh, yellow past 60%, red past 85% and `!` once idle exceeds the TTL (context is
+  then likely decached, so the next turn pays a full cache miss).
 - **THROUGHPUT** - recent output-token rate, a *relative* activity signal (see LIMITS for why
   it is not the official rate-limit percentage).
 - **SLURM**   - your running and pending jobs (`squeue`), with node and elapsed time.

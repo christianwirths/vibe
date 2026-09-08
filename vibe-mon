@@ -21,6 +21,8 @@ TAIL_BYTES = 256 * 1024          # how much of each transcript tail to parse
 RECENT_WINDOW = 300              # seconds counted as "recent" for throughput
 ACTIVE_WINDOW = 25               # seconds since last event to count a session "active"
 CACHE_TTL = float(os.environ.get("VIBE_CACHE_TTL", 3600))  # prompt-cache TTL; idle past this = decached
+_CTX_ENV = os.environ.get("VIBE_CTX_WINDOW")
+CTX_WINDOW = float(_CTX_ENV) if _CTX_ENV else 0.0  # 0 = adaptive per agent (200k, else 1M)
 
 NO_COLOR = bool(os.environ.get("NO_COLOR"))
 def c(code, s):
@@ -122,7 +124,7 @@ def agent_stats(session_id):
         return None
     evs = tail_events(path)
     if not evs:
-        return {"path": path, "last_ts": None, "doing": "-", "recent_tok": 0, "tail_tok": 0, "model": "-", "branch": "-"}
+        return {"path": path, "last_ts": None, "doing": "-", "recent_tok": 0, "tail_tok": 0, "model": "-", "branch": "-", "ctx": 0}
     last_ts = None
     recent_tok = 0
     tail_tok = 0
@@ -150,8 +152,12 @@ def agent_stats(session_id):
             if ts and ts.timestamp() >= cutoff:
                 recent_tok += ot
     doing = describe_activity(last_assist) if last_assist else "-"
-    return {"path": path, "last_ts": last_ts, "doing": doing,
-            "recent_tok": recent_tok, "tail_tok": tail_tok, "model": model, "branch": branch}
+    ctx = 0
+    if last_assist:
+        u = last_assist.get("message", {}).get("usage", {}) or {}
+        ctx = (u.get("input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0)
+    return {"path": path, "last_ts": last_ts, "doing": doing, "recent_tok": recent_tok,
+            "tail_tok": tail_tok, "model": model, "branch": branch, "ctx": ctx}
 
 def squeue_jobs():
     try:
@@ -373,20 +379,33 @@ def build(width):
     # LIMITS: live usage bars from /api/oauth/usage; fall back to transcript throttle events
     usage = usage_cached()
     p = [c(MAG, " LIMITS ") + c(DIM, "Claude")]
-    if usage:
-        for key, label in (("five_hour", "5h"), ("seven_day", "week")):
-            u = usage.get(key) or {}
-            pct = u.get("utilization")
+    lims = (usage or {}).get("limits")
+    if lims:
+        # one bar per active limit window: 5h session, weekly (all), and any model-scoped
+        # weekly (e.g. Fable). Source is the same `limits` array /usage renders.
+        for lm in lims:
+            pct = lm.get("percent")
             if pct is None:
                 continue
-            r = parse_ts(u.get("resets_at", "")) if isinstance(u.get("resets_at"), str) else None
+            kind = lm.get("kind")
+            if kind == "session":
+                label = "5h"
+            elif kind == "weekly_all":
+                label = "wk:all"
+            elif kind == "weekly_scoped":
+                mname = ((lm.get("scope") or {}).get("model") or {}).get("display_name") or "scoped"
+                label = f"wk:{mname}"
+            else:
+                label = kind or "?"
+            r = parse_ts(lm.get("resets_at", "")) if isinstance(lm.get("resets_at"), str) else None
             cd = dur((r - now_utc()).total_seconds()) if r else "?"
-            bcol = GRN if pct < 70 else (YEL if pct < 90 else RED)
-            p.append("  " + vpad(label, 6) + c(bcol, bar(pct, 16)) + f" {int(round(pct)):>3}%  " + c(DIM, f"resets {cd}"))
+            sev = lm.get("severity")
+            bcol = RED if (pct >= 90 or sev in ("critical", "exceeded")) else (YEL if (pct >= 70 or sev == "warning") else GRN)
+            p.append("  " + vpad(label, 9) + c(bcol, bar(pct, 14)) + f" {int(round(pct)):>3}%  " + c(DIM, f"resets {cd}"))
         stale = time.time() - _USAGE["ok_t"] if _USAGE["ok_t"] else 0
         if _USAGE["err"] and stale > USAGE_EVERY * 2:
             p.append("  " + c(DIM, f"stale {dur(stale)} ({_USAGE['err']})"))
-        p.append("  " + vpad("codex", 6) + c(DIM, "not configured"))
+        p.append("  " + vpad("codex", 9) + c(DIM, "not configured"))
     else:
         note = "waiting for usage..." if (_USAGE["ok_t"] == 0 and not _USAGE["err"]) \
             else f"usage unavailable ({_USAGE['err'] or '...'}) - throttle only"
@@ -395,24 +414,29 @@ def build(width):
             label = LIMIT_LABEL.get(typ, typ)
             resets = q.get("resetsAt", 0) or 0
             if q.get("status") == "rejected" and resets > time.time():
-                p.append("  " + vpad(label, 6) + c(RED, f"LIMITED, resets {dur(resets - time.time())}"))
+                p.append("  " + vpad(label, 9) + c(RED, f"LIMITED, resets {dur(resets - time.time())}"))
             else:
-                p.append("  " + vpad(label, 6) + c(GRN, "ok"))
+                p.append("  " + vpad(label, 9) + c(GRN, "ok"))
     panels.append(p)
 
     # AGENTS (parse each live session's transcript once, reuse for THROUGHPUT)
     sessions = read_sessions()
     agents = []
     stale = 0
+    seen = set()
     for s in sessions:
         if pid_alive(s.get("pid")):
-            label = str(s.get("tmux") or "").split(":")[0] or ("sess-" + str(s.get("sessionId", ""))[:6])
-            agents.append((label, agent_stats(s.get("sessionId", "")) or {}))
+            sid = s.get("sessionId", "")
+            if sid and sid in seen:        # same session double-registered (e.g. reused pid file)
+                continue
+            seen.add(sid)
+            label = str(s.get("tmux") or "").split(":")[0] or ("sess-" + str(sid)[:6])
+            agents.append((label, agent_stats(sid) or {}))
         else:
             stale += 1
     agents.sort(key=lambda t: t[0])
     p = [c(CYN, f" AGENTS ({len(agents)} live" + (f", {stale} off" if stale else "") + ")"),
-         c(DIM, "  " + "label".ljust(16) + "idle".ljust(8) + "doing".ljust(16) + "br".ljust(7) + "~tok".rjust(6))]
+         c(DIM, "  " + "label".ljust(15) + "idle".ljust(8) + "doing".ljust(15) + "br".ljust(5) + "ctx".ljust(11))]
     if not agents:
         p.append(c(DIM, "  (no live sessions here)"))
     for label, st in agents:
@@ -430,11 +454,17 @@ def build(width):
             scol, marker = YEL, " "
         else:
             scol, marker = GRY, " "
-        p.append("  " + vpad(label, 16)
+        # context-window fill from the last turn's prompt size
+        ctx = st.get("ctx", 0)
+        win = CTX_WINDOW or (1_000_000 if ctx > 200_000 else 200_000)
+        cpct = min(100, int(round(100 * ctx / win))) if ctx else 0
+        ccol = RED if cpct >= 85 else (YEL if cpct >= 70 else GRN)
+        ctx_txt = f"{kfmt(ctx)} {cpct}%" if ctx else "-"
+        p.append("  " + vpad(label, 15)
                  + vpad(f"{marker} {hms(last)}", 8, scol)
-                 + vpad(st.get("doing", "-"), 16, YEL if active else GRY)
-                 + vpad(st.get("branch", "-") or "-", 7)
-                 + f"{kfmt(st.get('tail_tok', 0)):>6}")
+                 + vpad(st.get("doing", "-"), 15, YEL if active else GRY)
+                 + vpad(st.get("branch", "-") or "-", 5)
+                 + vpad(ctx_txt, 11, ccol))
     panels.append(p)
 
     # THROUGHPUT (proxy)
