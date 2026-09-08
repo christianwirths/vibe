@@ -178,6 +178,64 @@ def node_reach(host, port=22, timeout=1.2):
     except Exception:
         return False
 
+# --- rate limits -----------------------------------------------------------
+# Claude Code records a `quotaLimits` object in the transcript ONLY when a request
+# is throttled/rejected (it carries rateLimitType, status, resetsAt). There is no
+# continuous "% of limit" persisted on disk, so this reports throttle state + reset
+# countdown per window, scanned from recent transcripts and cached.
+_LIMIT_CACHE = {"t": 0.0, "data": {}}
+LIMIT_LABEL = {"five_hour": "5h", "seven_day": "weekly", "weekly": "weekly", "monthly": "monthly"}
+
+def scan_limits(max_files=40, days=14, every=20):
+    now = time.time()
+    if now - _LIMIT_CACHE["t"] < every:
+        return _LIMIT_CACHE["data"]
+    cutoff = now - days * 86400
+    try:
+        files = [f for f in glob.glob(os.path.join(PROJ_DIR, "*", "*.jsonl"))
+                 if os.path.getmtime(f) >= cutoff]
+        files.sort(key=os.path.getmtime, reverse=True)
+    except Exception:
+        files = []
+    latest = {}  # rateLimitType -> (unix_ts, quota_dict)
+    for f in files[:max_files]:
+        try:
+            sz = os.path.getsize(f)
+            with open(f, "rb") as fh:
+                if sz > 512 * 1024:
+                    fh.seek(sz - 512 * 1024); fh.readline()
+                data = fh.read()
+        except Exception:
+            continue
+        if b"quotaLimits" not in data:
+            continue
+        for ln in data.decode("utf-8", "replace").splitlines():
+            if "quotaLimits" not in ln:
+                continue
+            try:
+                d = json.loads(ln)
+            except Exception:
+                continue
+            q = d.get("quotaLimits")
+            if not isinstance(q, dict):
+                continue
+            typ = q.get("rateLimitType", "?")
+            ts = parse_ts(d.get("timestamp", "")) if isinstance(d.get("timestamp"), str) else None
+            tv = ts.timestamp() if ts else 0.0
+            if typ not in latest or tv > latest[typ][0]:
+                latest[typ] = (tv, q)
+    _LIMIT_CACHE["t"] = now
+    _LIMIT_CACHE["data"] = latest
+    return latest
+
+def dur(secs):
+    secs = int(max(0, secs))
+    if secs < 3600:
+        return f"{secs//60}m"
+    if secs < 86400:
+        return f"{secs//3600}h{(secs%3600)//60:02d}"
+    return f"{secs//86400}d{(secs%86400)//3600:02d}h"
+
 # ---------- rendering ----------
 def hms(dt):
     if not dt:
@@ -216,6 +274,26 @@ def build(width):
     hdr = f" vibe mon  {c(BOLD, socket.gethostname())}  {now_utc().astimezone().strftime('%H:%M:%S')}  home={home_short}[{anchor}]"
     L.append(hdr)
     L.append(c(GRY, "-" * min(width, 78)))
+
+    # LIMITS (Claude): throttle state + reset countdown per window
+    lim = scan_limits()
+    L.append(c(MAG, " LIMITS ") + c(DIM, "Claude (throttle events only; no live % is stored on disk)"))
+    if not lim:
+        L.append("  " + c(DIM, "no throttle events on record (not rate-limited recently)"))
+    else:
+        for typ, (tv, q) in sorted(lim.items(), key=lambda kv: LIMIT_LABEL.get(kv[0], kv[0])):
+            label = LIMIT_LABEL.get(typ, typ)
+            resets = q.get("resetsAt", 0) or 0
+            limited = q.get("status") == "rejected" and resets > time.time()
+            if limited:
+                reason = q.get("overageDisabledReason") or ""
+                cell = c(RED, vpad(f"LIMITED, resets in {dur(resets - time.time())}", 32))
+                L.append("  " + vpad(label, 9) + cell + c(DIM, reason))
+            else:
+                ago = dur(time.time() - tv) if tv else "?"
+                L.append("  " + vpad(label, 9) + c(GRN, vpad("ok", 32)) + c(DIM, f"last throttle {ago} ago"))
+    L.append("  " + vpad("codex", 9) + c(DIM, "not configured"))
+    L.append("")
 
     # AGENTS (parse each live session's transcript once, reuse for THROUGHPUT)
     sessions = read_sessions()

@@ -58,12 +58,17 @@ Sessions are named `<tool>-<label>` (or `<tool>-<n>` when unnamed). Attaching us
 
 A compact, always-on dashboard meant to sit in a corner terminal:
 
+- **LIMITS**  - per-window throttle state for Claude (5h / weekly / ...): `ok` normally, or
+  `LIMITED, resets in Hh MMm` (red) with a live countdown when a request has actually been
+  rate-limited. Claude Code only writes rate-limit data to the transcript when a request is
+  throttled (a `quotaLimits` event with `resetsAt`); there is **no** continuous "% of limit
+  used" persisted anywhere on disk, so this panel reports *whether you are throttled and when
+  it clears*, not a fuel gauge. A `codex` row is stubbed for when a Codex CLI is added.
 - **AGENTS**  - every live Claude Code session on the home node: its label, idle/active
   state, what it is doing right now (tool call / thinking / writing), git branch, and
   per-session token totals.
-- **THROUGHPUT** - recent output-token rate as a *usage proxy*. Note: Claude Code does not
-  persist your live rate-limit consumption to disk anywhere readable, so this is token
-  activity, **not** the official "% of your 5h/weekly limit". Treat it as a relative gauge.
+- **THROUGHPUT** - recent output-token rate, a *relative* activity signal (see LIMITS for why
+  it is not the official rate-limit percentage).
 - **SLURM**   - your running and pending jobs (`squeue`), with node and elapsed time.
 - **NODES**   - reachability of the login nodes and whether the home-node anchor resolves.
 
