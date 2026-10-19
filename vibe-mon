@@ -9,8 +9,9 @@ NOTE on "usage": Claude Code does not persist your live rate-limit consumption t
 anywhere readable, so the THROUGHPUT panel shows recent output-token activity as a relative
 proxy, not the official percent-of-limit gauge.
 """
-import os, sys, re, glob, json, time, socket, subprocess, select, shutil, getpass, threading
+import os, sys, re, glob, json, time, socket, subprocess, select, shutil, getpass, threading, fcntl
 import urllib.request, urllib.error
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
@@ -251,8 +252,11 @@ def dur(secs):
 USAGE_URL = os.environ.get(
     "VIBE_USAGE_URL", "https://api.anthropic.com/api/oauth/usage?at_wall=1&skip_spend=1")
 USAGE_EVERY = float(os.environ.get("VIBE_USAGE_EVERY", 120))  # endpoint is itself rate-limited; poll gently
-USAGE_BACKOFF = 300                                           # wait longer after a failure (e.g. HTTP 429)
-# Keep last-known-good data across transient failures so the bars don't vanish on a blip.
+USAGE_BACKOFF = 300                                           # wait longer after a failure without Retry-After
+# All monitors (any node, shared $HOME) share one cache file, so N monitors cost one request per
+# USAGE_EVERY instead of N, and a fresh monitor shows bars at once. The file also keeps the
+# last-known-good data across transient failures so the bars don't vanish on a blip.
+USAGE_CACHE = os.path.join(HOME, ".cache", "vibe", "usage.json")
 _USAGE = {"data": None, "ok_t": 0.0, "next_t": 0.0, "inflight": False, "err": None}
 
 def oauth_token():
@@ -262,34 +266,98 @@ def oauth_token():
     except Exception:
         return None
 
-def _do_fetch():
-    ok = False
+def _read_cache():
     try:
-        tok = oauth_token()
-        if not tok:
-            _USAGE["err"] = "no token"
-            return
-        req = urllib.request.Request(USAGE_URL, headers={
-            "Authorization": f"Bearer {tok}",
-            "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": "vibe-mon",
-            "Accept": "application/json",
-        })
-        with urllib.request.urlopen(req, timeout=6) as r:
-            _USAGE["data"] = json.loads(r.read().decode("utf-8", "replace"))
-        _USAGE["ok_t"] = time.time()
-        _USAGE["err"] = None
-        ok = True
-    except urllib.error.HTTPError as e:
-        _USAGE["err"] = f"HTTP {e.code}"
+        with open(USAGE_CACHE) as fh:
+            return json.load(fh)
     except Exception:
-        _USAGE["err"] = "net error"
+        return {}
+
+def _write_cache(d):
+    try:
+        os.makedirs(os.path.dirname(USAGE_CACHE), exist_ok=True)
+        tmp = f"{USAGE_CACHE}.{socket.gethostname()}.{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump({k: d.get(k) for k in ("data", "ok_t", "next_t", "err")}, fh)
+        os.replace(tmp, USAGE_CACHE)  # atomic: readers never see a half-written file
+    except Exception:
+        pass
+
+def _claim():
+    """True if this monitor should fetch now. Under a lock, re-check the shared schedule and,
+    if due, push next_t forward so the other monitors stand down while we fetch."""
+    try:
+        os.makedirs(os.path.dirname(USAGE_CACHE), exist_ok=True)
+        lk = open(USAGE_CACHE + ".lock", "a")
+    except Exception:
+        return True
+    with lk:
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False          # another monitor is claiming right now
+        except OSError:
+            pass                  # filesystem without flock: best effort
+        sh = _read_cache()
+        if time.time() < (sh.get("next_t") or 0):
+            return False
+        sh["next_t"] = time.time() + USAGE_EVERY  # if we die mid-fetch, others take over after this
+        _write_cache(sh)
+        return True
+
+def _retry_after(v):
+    """Seconds from a Retry-After header (delta-seconds or HTTP-date); None if absent/unparsable."""
+    if not v:
+        return None
+    try:
+        return max(0.0, float(v))
+    except ValueError:
+        pass
+    try:
+        return max(0.0, (parsedate_to_datetime(v) - now_utc()).total_seconds())
+    except Exception:
+        return None
+
+def _do_fetch():
+    try:
+        if not _claim():
+            return
+        data, err, wait = None, None, None
+        try:
+            tok = oauth_token()
+            if not tok:
+                err = "no token"
+            else:
+                req = urllib.request.Request(USAGE_URL, headers={
+                    "Authorization": f"Bearer {tok}",
+                    "anthropic-beta": "oauth-2025-04-20",
+                    "User-Agent": "vibe-mon",
+                    "Accept": "application/json",
+                })
+                with urllib.request.urlopen(req, timeout=6) as r:
+                    data = json.loads(r.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            err = f"HTTP {e.code}"
+            wait = _retry_after(e.headers.get("Retry-After"))
+        except Exception:
+            err = "net error"
+        now = time.time()
+        sh = _read_cache()  # merge onto the latest shared state, keeping last-good data on failure
+        if data is not None:
+            sh.update(data=data, ok_t=now, err=None, next_t=now + USAGE_EVERY)
+        else:
+            # honour the server's Retry-After (never faster than our normal cadence); otherwise back off
+            sh.update(err=err, next_t=now + (max(wait, USAGE_EVERY) if wait is not None else USAGE_BACKOFF))
+        _write_cache(sh)
+        _USAGE.update({k: sh.get(k) for k in ("data", "ok_t", "next_t", "err")})
     finally:
-        # normal cadence on success; back off after a failure so we do not worsen a 429
-        _USAGE["next_t"] = time.time() + (USAGE_EVERY if ok else USAGE_BACKOFF)
         _USAGE["inflight"] = False
 
 def usage_cached():
+    sh = _read_cache()
+    if sh:
+        _USAGE.update(data=sh.get("data"), ok_t=sh.get("ok_t") or 0.0,
+                      next_t=sh.get("next_t") or 0.0, err=sh.get("err"))
     if not _USAGE["inflight"] and time.time() >= _USAGE["next_t"]:
         _USAGE["inflight"] = True
         threading.Thread(target=_do_fetch, daemon=True).start()
@@ -403,12 +471,13 @@ def build(width):
             bcol = RED if (pct >= 90 or sev in ("critical", "exceeded")) else (YEL if (pct >= 70 or sev == "warning") else GRN)
             p.append("  " + vpad(label, 9) + c(bcol, bar(pct, 14)) + f" {int(round(pct)):>3}%  " + c(DIM, f"resets {cd}"))
         stale = time.time() - _USAGE["ok_t"] if _USAGE["ok_t"] else 0
+        retry = dur(_USAGE["next_t"] - time.time())
         if _USAGE["err"] and stale > USAGE_EVERY * 2:
-            p.append("  " + c(DIM, f"stale {dur(stale)} ({_USAGE['err']})"))
+            p.append("  " + c(DIM, f"stale {dur(stale)} ({_USAGE['err']}, retry {retry})"))
         p.append("  " + vpad("codex", 9) + c(DIM, "not configured"))
     else:
         note = "waiting for usage..." if (_USAGE["ok_t"] == 0 and not _USAGE["err"]) \
-            else f"usage unavailable ({_USAGE['err'] or '...'}) - throttle only"
+            else f"usage unavailable ({_USAGE['err'] or '...'}, retry {dur(_USAGE['next_t'] - time.time())}) - throttle only"
         p.append("  " + c(DIM, note))
         for typ, (tv, q) in sorted(scan_limits().items(), key=lambda kv: LIMIT_LABEL.get(kv[0], kv[0])):
             label = LIMIT_LABEL.get(typ, typ)

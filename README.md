@@ -64,9 +64,12 @@ A compact, always-on dashboard meant to sit in a corner terminal:
   authenticated `GET /api/oauth/usage` endpoint using your OAuth token in
   `~/.claude/.credentials.json` (sent only to Anthropic's own API; `skip_spend=1`, so the read is
   free), refreshed by a background thread (default every 120s, `VIBE_USAGE_EVERY`; the endpoint
-  is itself rate-limited, so poll gently) so the UI never blocks. A bar turns yellow past 70% and
-  red past 90%. On a transient failure it keeps the last-known bars with a `stale` note and backs
-  off before retrying, rather than blanking. If it never succeeds (offline, token expired - open
+  is itself rate-limited, so poll gently) so the UI never blocks. All monitors share one cache,
+  `~/.cache/vibe/usage.json` (lock-guarded), so several `vibe mon` windows on any node cost one
+  request per interval between them and a new window shows bars at once. A bar turns yellow
+  past 70% and red past 90%. On a transient failure it keeps the last-known bars with a `stale`
+  note and backs off before retrying (honouring the server's `Retry-After` on HTTP 429, else
+  300s; the countdown is shown), rather than blanking. Delete the cache file to force a refetch. If it never succeeds (offline, token expired - open
   a Claude session to refresh it - or the *undocumented* endpoint changes in a future CLI
   release) it falls back to throttle state parsed from the transcripts. Override with
   `VIBE_USAGE_URL`. A `codex` row is stubbed for a future Codex CLI.
