@@ -44,7 +44,7 @@ vibe [tool] [label] [args...]
 ```
 
 - `vibe`                     pick/create a `work` session (plain shell)
-- `vibe claude StormGen`     attach or create `claude-StormGen`, running `claude`
+- `vibe claude myproject`    attach or create `claude-myproject`, running `claude`
 - `vibe claude Paper -R id`  pass extra args to the tool (here `claude -R id`)
 - `vibe --ls`   / `-l`       list sessions on the home node
 - `vibe --kill NAME` / `-k`  kill a session
