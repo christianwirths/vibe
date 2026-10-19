@@ -69,9 +69,10 @@ A compact, always-on dashboard meant to sit in a corner terminal:
   request per interval between them and a new window shows bars at once. A bar turns yellow
   past 70% and red past 90%. On a transient failure it keeps the last-known bars with a `stale`
   note and backs off before retrying (honouring the server's `Retry-After` on HTTP 429, else
-  300s; the countdown is shown), rather than blanking. Delete the cache file to force a refetch. If it never succeeds (offline, token expired - open
-  a Claude session to refresh it - or the *undocumented* endpoint changes in a future CLI
-  release) it falls back to throttle state parsed from the transcripts. Override with
+  300s; the countdown is shown), rather than blanking. Delete the cache file to force a
+  refetch. If it never succeeds (offline, token expired - open a Claude session to refresh it -
+  or the *undocumented* endpoint changes in a future CLI release) it falls back to throttle
+  state parsed from the transcripts. Override with
   `VIBE_USAGE_URL`. A `codex` row is stubbed for a future Codex CLI.
 - **AGENTS**  - every live Claude Code session on the home node: its label, idle time, what it
   is doing right now (tool call / thinking / writing), git branch, and its **context-window
@@ -80,7 +81,18 @@ A compact, always-on dashboard meant to sit in a corner terminal:
   `VIBE_CTX_WINDOW` to pin it. The fill turns yellow past 70% and red past 85%. The idle timer is
   coloured by proximity to the prompt-cache TTL (`VIBE_CACHE_TTL`, default 3600s): green `*`
   active, grey fresh, yellow past 60%, red past 85% and `!` once idle exceeds the TTL (context is
-  then likely decached, so the next turn pays a full cache miss).
+  then likely decached, so the next turn pays a full cache miss). A session without a recorded
+  tmux name is labelled by the tmux pane it runs in, else by its project folder.
+- **TASKS**   - the per-user cap of the node's cgroup (`user-<uid>.slice`; on UBELIX submit nodes
+  750 tasks and 25 GiB) and who uses it. **Every thread counts as a task.** At the cap no thread
+  can start, and every Claude session on the node aborts at once ("Aborted (core dumped)"). Your
+  processes are grouped by name: a Claude session together with its tool shells and background
+  monitors (named like AGENTS), a tmux pane, or a top-level process tree named after its heaviest
+  program (`train.py`, `vscode-server`) or its script (`watch_jobs.sh`), with the
+  folder it runs in. Each group shows tasks and RSS. **Orphaned bg** are Claude background shells
+  whose session died, which still hold tasks; the panel prints the `kill -- -PID` that removes
+  each whole tree. The bar turns yellow past 65% and red past 85%, and a cap hit or OOM kill
+  since the monitor started is shown in red.
 - **THROUGHPUT** - recent output-token rate, a *relative* activity signal (see LIMITS for why
   it is not the official rate-limit percentage).
 - **SLURM**   - your running and pending jobs (`squeue`), with node and elapsed time.

@@ -187,6 +187,243 @@ def node_reach(host, port=22, timeout=1.2):
     except Exception:
         return False
 
+# --- per-user task / memory cap ----------------------------------------------
+# UBELIX submit nodes cap each user's cgroup (user-<uid>.slice) at ~750 tasks - every THREAD
+# counts, not just processes - and ~25 GiB. At the task cap no new thread can start and Claude
+# aborts ("Aborted (core dumped)"), taking down every session on the node at once. The TASKS
+# panel shows the cap and which process groups use it.
+UID = os.getuid()
+SHELLS = {"bash", "sh", "zsh", "dash", "fish"}
+TRIVIAL = {"sleep", "tail", "head", "cut", "sed", "grep", "awk", "cat", "tee", "wc", "xargs"}  # never name a group
+BG_TASK = re.compile(r"claude-[0-9a-f]+-cwd")  # Claude Code's background-Bash wrapper shell
+_CAP = {"pids_ev": None, "oom_ev": None, "pids_hit_t": 0.0, "pids_new": 0, "oom_hit_t": 0.0, "oom_new": 0}
+
+def user_cgroup():
+    """This user's slice in the cgroup-v2 tree (holds the per-user caps), or None."""
+    try:
+        rel = next(ln[3:].strip() for ln in open("/proc/self/cgroup") if ln.startswith("0::"))
+    except Exception:
+        return None
+    d = "/sys/fs/cgroup" + rel
+    while d.startswith("/sys/fs/cgroup/"):
+        if os.path.basename(d) == f"user-{UID}.slice":
+            return d
+        d = os.path.dirname(d)
+    return None
+
+def _cg(d, name):
+    try:
+        return open(os.path.join(d, name)).read().strip()
+    except Exception:
+        return None
+
+def _cg_int(d, name, key=None):
+    """An integer cgroup value; with `key`, from a `key value` file such as pids.events.
+    None if absent or 'max' (unlimited)."""
+    txt = _cg(d, name) if d else None
+    if txt is None:
+        return None
+    if key:
+        txt = next((v for k, _, v in (ln.partition(" ") for ln in txt.splitlines()) if k == key), None)
+    try:
+        return int(txt)
+    except (TypeError, ValueError):
+        return None
+
+def my_procs():
+    """{pid: {ppid, name, threads, rss, argv}} for every process of this user, read from /proc."""
+    out = {}
+    for e in os.listdir("/proc"):
+        if not e.isdigit():
+            continue
+        try:
+            if os.stat(f"/proc/{e}").st_uid != UID:
+                continue
+            st = {}
+            for ln in open(f"/proc/{e}/status"):
+                k, _, v = ln.partition(":")
+                if k in ("Name", "PPid", "Threads", "VmRSS"):
+                    st[k] = v.strip()
+            argv = open(f"/proc/{e}/cmdline", "rb").read().split(b"\0")
+            out[int(e)] = {"pid": int(e), "ppid": int(st.get("PPid", 0)), "name": st.get("Name", "?"),
+                           "threads": int(st.get("Threads", 1)),
+                           "rss": int(st.get("VmRSS", "0 kB").split()[0]) * 1024,
+                           "argv": [a.decode("utf-8", "replace") for a in argv if a]}
+        except Exception:
+            continue  # exited while we looked
+    return out
+
+def tmux_panes():
+    """{pane shell pid: tmux session name} for this user's tmux server on this node."""
+    try:
+        r = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{pane_pid} #{session_name}"],
+                           capture_output=True, text=True, timeout=3)
+    except Exception:
+        return {}
+    return {int(p): s for p, _, s in (ln.partition(" ") for ln in r.stdout.splitlines()) if p.isdigit()}
+
+def session_label(s, procs, panes):
+    """Name for a Claude session: its recorded tmux session, else the tmux pane it runs in,
+    else its project folder."""
+    lbl = str(s.get("tmux") or "").split(":")[0]
+    if lbl:
+        return lbl
+    try:
+        cur, hops = int(s.get("pid")), 0
+    except Exception:
+        cur, hops = None, 0
+    while cur in procs and hops < 64:
+        if cur in panes:
+            return panes[cur]
+        cur, hops = procs[cur]["ppid"], hops + 1
+    cwd = str(s.get("cwd") or "").rstrip("/")
+    return os.path.basename(cwd) if cwd else "sess-" + str(s.get("sessionId", ""))[:6]
+
+def proc_label(p):
+    """Readable name for a non-agent process: the script for interpreters, else the command."""
+    argv, name = p["argv"], p["name"]
+    joined = " ".join(argv)
+    if ".vscode-server" in joined:
+        return "vscode-server"
+    if "vibe-mon" in joined:
+        return "vibe mon"
+    if name.startswith("tmux"):
+        return "tmux"
+    if name == "systemd":
+        return "systemd --user"
+    if name in SHELLS:  # `bash script.sh` -> script.sh; `bash -c ...` / interactive -> bash
+        script = next((a for a in argv[1:] if not a.startswith("-")), None)
+        return os.path.basename(script) if script and "-c" not in argv else name
+    if name.startswith("python") or (argv and os.path.basename(argv[0]).startswith("python")):
+        for i, a in enumerate(argv[1:], 1):
+            if a == "-m" and i + 1 < len(argv):
+                return argv[i + 1]
+            if a.endswith(".py"):
+                return os.path.basename(a)
+        return "python"
+    return name
+
+def proc_where(p):
+    """Folder a process runs in (basename), to tell same-named scripts of different projects apart."""
+    try:
+        cwd = os.readlink(f"/proc/{p['pid']}/cwd")
+    except Exception:
+        return "-"
+    return "~" if cwd == HOME else os.path.basename(cwd.rstrip("/")) or "/"
+
+def task_groups(procs, panes, agents):
+    """Assign every process to a named group and sum its tasks (threads) and RSS.
+    Walking up the parent chain, a process belongs to the first Claude session or tmux pane it
+    finds (so a session's tool shells and background monitors count against that session);
+    failing that, to its top-level ancestor. A top-level Claude background shell that was
+    re-parented to init/systemd lost its session: it is an orphan, still holding tasks."""
+    memo = {}
+    def anchor(pid):
+        path, cur, res = [], pid, None
+        while res is None:
+            if cur in memo:
+                res = memo[cur]
+            elif cur in agents:
+                res = ("ses", agents[cur], True)
+            elif cur in panes:
+                res = ("ses", panes[cur], False)
+            else:
+                p = procs[cur]
+                path.append(cur)
+                par = procs.get(p["ppid"])
+                if par is None or par["name"] == "systemd":
+                    reaped = p["ppid"] == 1 or par is not None
+                    orphan = reaped and (BG_TASK.search(" ".join(p["argv"])) or p["name"] == "claude")
+                    res = ("orphan", cur, False) if orphan else ("root", cur, False)
+                else:
+                    cur = p["ppid"]
+        for q in path:
+            memo[q] = res
+        return res
+
+    groups = {}
+    for pid, p in procs.items():
+        typ, key, is_agent = anchor(pid)
+        g = groups.setdefault((typ, key if typ != "orphan" else ""),
+                              {"tasks": 0, "rss": 0, "procs": [], "agent": False, "roots": set()})
+        g["tasks"] += p["threads"]
+        g["rss"] += p["rss"]
+        g["procs"].append(p)
+        g["agent"] |= is_agent
+        if typ == "orphan":
+            g["roots"].add(key)
+
+    rows = {}  # (label, where) -> row; same-named top-level groups merge (e.g. several vscode trees)
+    for (typ, key), g in groups.items():
+        if typ == "ses":
+            label, where = key, ("claude" if g["agent"] else "tmux")
+        elif typ == "orphan":
+            label, where = f"orphaned bg x{len(g['roots'])}", "no session"
+        else:
+            # name the group after its heaviest real program; a tree of shells and sleep/tail is a
+            # script loop, named after its top-level shell (e.g. watch_jobs.sh)
+            heavy = [q for q in g["procs"] if q["name"] not in SHELLS | TRIVIAL]
+            rep = max(heavy, key=lambda q: q["threads"]) if heavy else procs[key]
+            label, where = proc_label(rep), proc_where(rep)
+        r = rows.setdefault((label, where), {"label": label, "where": where, "tasks": 0, "rss": 0,
+                                             "orphan": typ == "orphan", "roots": set()})
+        r["tasks"] += g["tasks"]
+        r["rss"] += g["rss"]
+        r["roots"] |= g["roots"]
+    return sorted(rows.values(), key=lambda r: -r["tasks"])
+
+def bfmt(n):
+    if n >= 1 << 30:
+        return f"{n / (1 << 30):.1f}G"
+    return f"{n / (1 << 20):.0f}M"
+
+def tasks_panel(procs, panes, agents, maxrows=9):
+    cg = user_cgroup()
+    rows = task_groups(procs, panes, agents)
+    cur = _cg_int(cg, "pids.current") or sum(r["tasks"] for r in rows)
+    cap = _cg_int(cg, "pids.max")
+    mcur, mcap = _cg_int(cg, "memory.current"), _cg_int(cg, "memory.max")
+    # cap hits since this monitor started (the kernel counters are cumulative over the slice's life)
+    now = time.time()
+    for ev, fname, key, t_key, n_key in (("pids_ev", "pids.events", "max", "pids_hit_t", "pids_new"),
+                                         ("oom_ev", "memory.events", "oom_kill", "oom_hit_t", "oom_new")):
+        v = _cg_int(cg, fname, key)
+        if v is None:
+            continue
+        if _CAP[ev] is not None and v > _CAP[ev]:
+            _CAP[t_key], _CAP[n_key] = now, _CAP[n_key] + (v - _CAP[ev])
+        _CAP[ev] = v
+
+    if cap:
+        pct = 100.0 * cur / cap
+        bcol = RED if pct >= 85 else (YEL if pct >= 65 else GRN)
+        head = c(YEL, " TASKS ") + f"{cur}/{cap} " + c(bcol, bar(pct, 12)) + f" {int(pct):>3}%"
+    else:
+        head = c(YEL, " TASKS ") + f"{cur} " + c(DIM, "(no per-user cap found)")
+    if mcur is not None:
+        head += c(DIM, f"  mem {bfmt(mcur)}" + (f"/{bfmt(mcap)}" if mcap else ""))
+    p = [head]
+    for t_key, n_key, what in (("pids_hit_t", "pids_new", "task cap HIT"), ("oom_hit_t", "oom_new", "OOM kill")):
+        if _CAP[t_key]:
+            ago = now - _CAP[t_key]
+            p.append("  " + c(RED if ago < 900 else YEL, f"{what} {dur(ago)} ago (x{_CAP[n_key]} since mon start)"))
+    p.append(c(DIM, "  " + "group".ljust(25) + "where".ljust(13) + "tasks".rjust(6) + "mem".rjust(7)))
+    for r in rows[:maxrows]:
+        share = r["tasks"] / cap if cap else 0
+        col = RED if r["orphan"] else (YEL if share >= 0.25 else None)
+        tasks_txt = f"{r['tasks']:>6}"
+        p.append("  " + vpad(r["label"], 24, col) + " " + vpad(r["where"], 13, GRY)
+                 + (c(col, tasks_txt) if col else tasks_txt) + f"{bfmt(r['rss']):>7}")
+        if r["orphan"]:
+            # each background shell leads its own process group, so -PID takes the whole tree
+            roots = sorted(r["roots"])
+            p.append("    " + c(RED, "kill -- " + " ".join(f"-{pid}" for pid in roots[:4]))
+                     + (c(DIM, f" +{len(roots) - 4}") if len(roots) > 4 else ""))
+    if len(rows) > maxrows:
+        rest = rows[maxrows:]
+        p.append(c(DIM, f"  + {len(rest)} more groups".ljust(40) + f"{sum(r['tasks'] for r in rest):>6}"))
+    return p
+
 # --- rate limits -----------------------------------------------------------
 # Claude Code records a `quotaLimits` object in the transcript ONLY when a request
 # is throttled/rejected (it carries rateLimitType, status, resetsAt). There is no
@@ -360,7 +597,10 @@ def usage_cached():
                       next_t=sh.get("next_t") or 0.0, err=sh.get("err"))
     if not _USAGE["inflight"] and time.time() >= _USAGE["next_t"]:
         _USAGE["inflight"] = True
-        threading.Thread(target=_do_fetch, daemon=True).start()
+        try:
+            threading.Thread(target=_do_fetch, daemon=True).start()
+        except RuntimeError:          # "can't start new thread": at the task cap; try next tick
+            _USAGE["inflight"] = False
     return _USAGE["data"]
 
 def bar(pct, width=18):
@@ -490,6 +730,8 @@ def build(width):
 
     # AGENTS (parse each live session's transcript once, reuse for THROUGHPUT)
     sessions = read_sessions()
+    procs, panes = my_procs(), tmux_panes()
+    agent_pids = {}                         # pid -> label, reused by the TASKS panel
     agents = []
     stale = 0
     seen = set()
@@ -499,7 +741,8 @@ def build(width):
             if sid and sid in seen:        # same session double-registered (e.g. reused pid file)
                 continue
             seen.add(sid)
-            label = str(s.get("tmux") or "").split(":")[0] or ("sess-" + str(sid)[:6])
+            label = session_label(s, procs, panes)
+            agent_pids[int(s["pid"])] = label
             agents.append((label, agent_stats(sid) or {}))
         else:
             stale += 1
@@ -535,6 +778,9 @@ def build(width):
                  + vpad(st.get("branch", "-") or "-", 5)
                  + vpad(ctx_txt, 11, ccol))
     panels.append(p)
+
+    # TASKS: per-user task/memory cap and who is using it
+    panels.append(tasks_panel(procs, panes, agent_pids))
 
     # THROUGHPUT (proxy)
     total_recent = sum(st.get("recent_tok", 0) for _, st in agents)
