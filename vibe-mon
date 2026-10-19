@@ -263,11 +263,8 @@ def tmux_panes():
     return {int(p): s for p, _, s in (ln.partition(" ") for ln in r.stdout.splitlines()) if p.isdigit()}
 
 def session_label(s, procs, panes):
-    """Name for a Claude session: its recorded tmux session, else the tmux pane it runs in,
-    else its project folder."""
-    lbl = str(s.get("tmux") or "").split(":")[0]
-    if lbl:
-        return lbl
+    """Name for a Claude session: the tmux session its pane is in now (the name Claude records
+    at start goes stale on `vibe --rename`), else that recorded name, else its project folder."""
     try:
         cur, hops = int(s.get("pid")), 0
     except Exception:
@@ -276,6 +273,9 @@ def session_label(s, procs, panes):
         if cur in panes:
             return panes[cur]
         cur, hops = procs[cur]["ppid"], hops + 1
+    lbl = str(s.get("tmux") or "").split(":")[0]
+    if lbl:
+        return lbl
     cwd = str(s.get("cwd") or "").rstrip("/")
     return os.path.basename(cwd) if cwd else "sess-" + str(s.get("sessionId", ""))[:6]
 
