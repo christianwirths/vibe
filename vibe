@@ -55,13 +55,13 @@ case "$tool" in
   --ls|-l)
     tmux ls 2>/dev/null || echo "(no sessions)"; exit 0 ;;
   --kill|-k)
-    tmux kill-session -t "${1:?usage: vibe --kill <session>}" && echo "vibe: killed '$1'"; exit 0 ;;
+    tmux kill-session -t "=${1:?usage: vibe --kill <session>}" && echo "vibe: killed '$1'"; exit 0 ;;
   --rename|-r)
     old="${1:?usage: vibe --rename <session> <new-label>}"
     lbl="${2:?usage: vibe --rename <session> <new-label>}"; lbl="${lbl//[^a-zA-Z0-9_-]/_}"
     pfx="${old%%-*}"                    # keep the <tool>- prefix so it stays in the picker
     if [[ "$pfx" != "$old" ]]; then new="${pfx}-${lbl}"; else new="$lbl"; fi
-    tmux rename-session -t "$old" "$new" && echo "vibe: renamed '$old' -> '$new'"; exit 0 ;;
+    tmux rename-session -t "=$old" "$new" && echo "vibe: renamed '$old' -> '$new'"; exit 0 ;;
 esac
 
 # Optional explicit label: first remaining arg. Rest = args to the tool.
@@ -76,6 +76,8 @@ else
   INNER="$(printf '%q ' "$tool" "$@"); exec \$SHELL"
 fi
 
+# Every -t below uses "=name": tmux otherwise falls back to PREFIX matching, so a missing
+# claude-foo would silently resolve to claude-foo-bar (wrong attach, or --kill of the wrong one).
 new_session() { # $1 = session name
   if [[ -z "$INNER" ]]; then tmux new -d -s "$1"; else tmux new -d -s "$1" "$INNER"; fi
 }
@@ -83,14 +85,14 @@ enter() {       # $1 = session name (switch if inside tmux, else attach)
   # attach -d detaches any stale/other client first, so you never end up with
   # two differently-sized clients on one session (the usual cause of garbled,
   # misaligned redraws when reconnecting from a different place).
-  if [[ -n "${TMUX:-}" ]]; then exec tmux switch-client -t "$1"; else exec tmux attach -d -t "$1"; fi
+  if [[ -n "${TMUX:-}" ]]; then exec tmux switch-client -t "=$1"; else exec tmux attach -d -t "=$1"; fi
 }
 ensure_enter() { # $1 = session name
-  tmux has-session -t "$1" 2>/dev/null || new_session "$1"
+  tmux has-session -t "=$1" 2>/dev/null || new_session "$1"
   enter "$1"
 }
 annotate() {     # $1 = session name -> "2w, detached"
-  tmux display-message -p -t "$1" \
+  tmux display-message -p -t "=$1:" \
     '#{session_windows}w, #{?session_attached,attached,detached}' 2>/dev/null || true
 }
 
@@ -123,7 +125,7 @@ choice="$(menu "${existing[@]}")"
 case "$choice" in
   __cancel__) echo "vibe: cancelled." >&2; exit 0 ;;
   __new__)
-    n=1; while tmux has-session -t "${base}-${n}" 2>/dev/null; do ((n++)); done
+    n=1; while tmux has-session -t "=${base}-${n}" 2>/dev/null; do ((n++)); done
     new_session "${base}-${n}"; enter "${base}-${n}" ;;
   *) enter "$choice" ;;
 esac
